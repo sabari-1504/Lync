@@ -1,19 +1,12 @@
 "use client";
 
 import {
-  ArrowUpDown,
   Bookmark,
   Clock3,
-  LogOut,
+  Trash2,
 } from "lucide-react";
+import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { User } from "firebase/auth";
-import {
-  createUserWithEmailAndPassword,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-} from "firebase/auth";
 import {
   addDoc,
   collection,
@@ -23,7 +16,9 @@ import {
   serverTimestamp,
   type Timestamp,
 } from "firebase/firestore";
-import { auth, db, isFirebaseConfigured } from "@/lib/firebase";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/contexts/auth-context";
+import { speakerForLanguage } from "@/lib/voice-preference";
 
 type LanguageCode = "en" | "ta" | "ml" | "hi";
 
@@ -86,13 +81,15 @@ const languageByCode = LANGUAGE_OPTIONS.reduce<Record<LanguageCode, LanguageOpti
   {} as Record<LanguageCode, LanguageOption>,
 );
 
+const SARVAM_LANG: Record<LanguageCode, string> = {
+  en: "en-IN",
+  ta: "ta-IN",
+  ml: "ml-IN",
+  hi: "hi-IN",
+};
+
 export default function Home() {
-  const [user, setUser] = useState<User | null>(null);
-  const [isAuthReady, setIsAuthReady] = useState(!isFirebaseConfigured);
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [isSignupMode, setIsSignupMode] = useState(false);
-  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const { user } = useAuth();
   const [speakerALanguage, setSpeakerALanguage] = useState<LanguageCode>("en");
   const [speakerBLanguage, setSpeakerBLanguage] = useState<LanguageCode>("hi");
   const [isListeningA, setIsListeningA] = useState(false);
@@ -103,9 +100,6 @@ export default function Home() {
   const [translationHistory, setTranslationHistory] = useState<HistoryEntry[]>([]);
   const [savedTranslations, setSavedTranslations] = useState<HistoryEntry[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
-  const [speakerIconPulse, setSpeakerIconPulse] = useState(0);
-  const [micAPulse, setMicAPulse] = useState(0);
-  const [micBPulse, setMicBPulse] = useState(0);
 
   const recognitionARef = useRef<SpeechRecognitionLike | null>(null);
   const recognitionBRef = useRef<SpeechRecognitionLike | null>(null);
@@ -144,25 +138,92 @@ export default function Home() {
     });
   };
 
-  const getBestVoiceForLanguage = (targetLanguage: LanguageCode) => {
+  const getBestVoiceForLanguage = (targetLanguage: LanguageCode): SpeechSynthesisVoice | null => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       return null;
     }
 
     const voices = voicesRef.current;
-    const fullLang = languageByCode[targetLanguage].speechCode.toLowerCase();
-    const baseLang = targetLanguage.toLowerCase();
+    const opt = languageByCode[targetLanguage];
+    const candidates = [
+      opt.speechCode.toLowerCase().replace("_", "-"),
+      `${targetLanguage.toLowerCase()}-in`,
+      `${targetLanguage.toLowerCase()}_in`,
+      targetLanguage.toLowerCase(),
+    ];
 
-    return (
-      voices.find((voice) => voice.lang.toLowerCase() === fullLang) ||
-      voices.find((voice) => voice.lang.toLowerCase().startsWith(fullLang.split("-")[0])) ||
-      voices.find((voice) => voice.lang.toLowerCase().startsWith(baseLang)) ||
-      null
-    );
+    const normalize = (s: string) => s.toLowerCase().replace("_", "-");
+
+    for (const want of candidates) {
+      const exact = voices.find((v) => normalize(v.lang) === want);
+      if (exact) return exact;
+    }
+
+    for (const want of candidates) {
+      const prefix = want.split("-")[0];
+      const byPrefix = voices.find(
+        (v) =>
+          normalize(v.lang).startsWith(prefix + "-") || normalize(v.lang) === prefix,
+      );
+      if (byPrefix) return byPrefix;
+    }
+
+    return null;
   };
 
-  const speakText = (text: string, targetLanguage: LanguageCode) => {
-    if (!text || typeof window === "undefined" || !("speechSynthesis" in window)) {
+  const speakWithCloudTts = async (text: string, targetLanguage: LanguageCode): Promise<boolean> => {
+    const target_language_code = SARVAM_LANG[targetLanguage];
+    const speaker = speakerForLanguage(target_language_code);
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          target_language_code,
+          speaker,
+        }),
+      });
+      const data = (await res.json()) as { error?: string; audioBase64?: string };
+      if (!res.ok) {
+        throw new Error(data.error || "TTS request failed");
+      }
+      const b64 = data.audioBase64;
+      if (!b64) return false;
+
+      const binary = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const blob = new Blob([binary], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      await new Promise<void>((resolve, reject) => {
+        const audio = new Audio(url);
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          resolve();
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error("Playback error"));
+        };
+        void audio.play().catch(reject);
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const speakText = async (text: string, targetLanguage: LanguageCode) => {
+    if (!text || typeof window === "undefined") {
+      return;
+    }
+
+    const cloud = await speakWithCloudTts(text, targetLanguage);
+    if (cloud) {
+      return;
+    }
+
+    if (!("speechSynthesis" in window)) {
+      setErrorMessage("Speech playback is not supported in this browser.");
       return;
     }
 
@@ -170,7 +231,7 @@ export default function Home() {
 
     if (!selectedVoice && targetLanguage !== "en") {
       setErrorMessage(
-        `No ${languageByCode[targetLanguage].name} voice is installed in this browser/OS. Install that language TTS voice to hear translated audio.`,
+        `Cloud voice unavailable and no ${languageByCode[targetLanguage].name} system voice found. Check your connection or install a language pack.`,
       );
     }
 
@@ -259,7 +320,7 @@ export default function Home() {
         }
       }
 
-      speakText(translated, targetLanguage);
+      await speakText(translated, targetLanguage);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Unknown translation error");
     } finally {
@@ -356,21 +417,9 @@ export default function Home() {
     recognitionBRef.current?.stop();
   };
 
-  const playSpeakerAudio = (text: string, targetLanguage: LanguageCode) => {
-    setSpeakerIconPulse((value) => value + 1);
-    speakText(text, targetLanguage);
+  const playSpeakerAudio = async (text: string, targetLanguage: LanguageCode) => {
+    await speakText(text, targetLanguage);
   };
-
-  useEffect(() => {
-    if (!auth) {
-      return;
-    }
-    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
-      setUser(nextUser);
-      setIsAuthReady(true);
-    });
-    return () => unsubscribe();
-  }, []);
 
   useEffect(() => {
     if (!user || !db) {
@@ -445,32 +494,6 @@ export default function Home() {
     };
   }, []);
 
-  const handleAuthSubmit = async () => {
-    if (!auth) {
-      setErrorMessage("Firebase is not configured. Add NEXT_PUBLIC_FIREBASE_* values in .env.local.");
-      return;
-    }
-    if (!authEmail.trim() || !authPassword.trim()) {
-      setErrorMessage("Email and password are required.");
-      return;
-    }
-
-    setIsAuthLoading(true);
-    clearError();
-    try {
-      if (isSignupMode) {
-        await createUserWithEmailAndPassword(auth, authEmail.trim(), authPassword);
-      } else {
-        await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword);
-      }
-      setAuthPassword("");
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Authentication failed.");
-    } finally {
-      setIsAuthLoading(false);
-    }
-  };
-
   const saveCurrentTranslation = async () => {
     if (!user) {
       setErrorMessage("Please sign in to save translations.");
@@ -495,96 +518,77 @@ export default function Home() {
     }
   };
 
-  if (!isAuthReady) {
-    return <div className="min-h-screen bg-[#f0f3f8] p-6 text-[#1d2a35]">Loading...</div>;
-  }
+  const clearCurrentTranslation = () => {
+    setSpeakerATranscript("");
+    setToSpeakerBText("");
+    setToSpeakerAText("");
+    lastFinalARef.current = "";
+    lastFinalBRef.current = "";
+    clearError();
+  };
 
-  if (!user) {
+  const micButton = (speaker: SpeakerKey) => {
+    const listening = speaker === "A" ? isListeningA : isListeningB;
     return (
-      <div className="min-h-screen bg-[#f0f3f8] px-3 py-6 text-[#1d2a35] md:px-6">
-        <main className="mx-auto max-w-md rounded-[28px] border border-[#d7deea] bg-[#f8fbff] p-5 shadow-[0_15px_50px_rgba(20,65,110,0.08)]">
-          <h1 className="text-xl font-semibold text-[#1d2a35]">
-            {isSignupMode ? "Create account" : "Sign in"}
-          </h1>
-          {!isFirebaseConfigured ? (
-            <p className="mt-2 rounded-xl bg-[#fff6db] px-3 py-2 text-xs text-[#6f5600]">
-              Firebase is not configured yet. Fill all NEXT_PUBLIC_FIREBASE_* values in `.env.local`.
-            </p>
-          ) : null}
-          <p className="mt-1 text-sm text-[#5a6f8a]">
-            {isSignupMode ? "Sign up to save translation data." : "Sign in to access your data."}
-          </p>
-          <div className="mt-4 space-y-3">
-            <input
-              className="w-full rounded-xl border border-[#dce5f1] bg-white px-3 py-2 text-sm outline-none"
-              placeholder="Email"
-              type="email"
-              value={authEmail}
-              onChange={(event) => setAuthEmail(event.target.value)}
-            />
-            <input
-              className="w-full rounded-xl border border-[#dce5f1] bg-white px-3 py-2 text-sm outline-none"
-              placeholder="Password"
-              type="password"
-              value={authPassword}
-              onChange={(event) => setAuthPassword(event.target.value)}
-            />
-          </div>
-          <button
-            type="button"
-            onClick={handleAuthSubmit}
-            disabled={isAuthLoading || !isFirebaseConfigured}
-            className="mt-4 w-full rounded-xl bg-[#0a84ff] px-4 py-2 text-sm font-semibold text-white disabled:opacity-70"
-          >
-            {isAuthLoading ? "Please wait..." : isSignupMode ? "Sign up" : "Sign in"}
-          </button>
-          <button
-            type="button"
-            onClick={() => setIsSignupMode((value) => !value)}
-            disabled={!isFirebaseConfigured}
-            className="mt-3 text-sm text-[#1f4f7b]"
-          >
-            {isSignupMode ? "Already have an account? Sign in" : "No account? Sign up"}
-          </button>
-          {errorMessage ? (
-            <p className="mt-4 rounded-xl bg-[#ffdfe3] px-3 py-2 text-sm text-[#8a2832]">{errorMessage}</p>
-          ) : null}
-        </main>
-      </div>
+      <button
+        type="button"
+        onClick={() => {
+          if (listening) {
+            stopListening(speaker);
+            return;
+          }
+          startListening(speaker);
+        }}
+        className={`flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl border transition ${
+          listening
+            ? "border-[var(--electric-cyan)] bg-[var(--cyan-muted)] shadow-[0_0_36px_rgba(0,245,255,0.5)] ring-2 ring-[var(--electric-cyan)]/35"
+            : "border-[var(--border-subtle)] bg-[var(--bg-base)] hover:border-[var(--border-strong)]"
+        }`}
+        title={speaker === "A" ? "Microphone · Speaker A" : "Microphone · Speaker B"}
+      >
+        <Image
+          src="/microphone.gif"
+          alt="Microphone"
+          width={36}
+          height={36}
+          unoptimized
+          className={listening ? "" : "opacity-60 grayscale"}
+        />
+      </button>
     );
-  }
+  };
 
   return (
-    <div className="min-h-screen bg-[#f0f3f8] px-3 py-6 text-[#1d2a35] md:px-6">
-      <main className="mx-auto max-w-6xl rounded-[28px] border border-[#d7deea] bg-[#f8fbff] p-4 shadow-[0_15px_50px_rgba(20,65,110,0.08)] md:p-6">
-        <header className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="rounded-lg bg-[#0a84ff] px-2 py-1 text-sm font-bold text-white">L2</div>
-            <div>
-              <p className="text-xs font-semibold tracking-[0.2em] text-[#4d6480]">LINGUA</p>
-              <p className="text-xs font-semibold tracking-[0.2em] text-[#4d6480]">ULTRA</p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={() => {
-              if (auth) {
-                void signOut(auth);
-              }
-            }}
-            className="inline-flex items-center gap-2 rounded-lg border border-[#dce5f1] bg-white px-3 py-1.5 text-sm text-[#385678]"
-          >
-            <LogOut size={15} />
-            Sign out
-          </button>
+    <main className="relative flex min-h-0 flex-col overflow-auto">
+      <div
+        className="pointer-events-none absolute inset-0 opacity-[0.45]"
+        style={{
+          background:
+            "radial-gradient(ellipse 85% 55% at 50% -15%, rgba(0, 245, 255, 0.14), transparent), radial-gradient(ellipse 55% 45% at 100% 5%, rgba(112, 0, 255, 0.12), transparent)",
+        }}
+        aria-hidden
+      />
+
+      <div className="relative z-10 mx-auto w-full max-w-5xl flex-1 px-4 py-8 md:px-8 md:py-12">
+        <header className="mb-10">
+          <h2 className="text-3xl font-bold tracking-tight text-[var(--text-primary)] md:text-4xl">
+            Two-way speech bridge
+          </h2>
+          <p className="mt-2 max-w-xl text-sm text-[var(--text-secondary)]">
+            Choose languages for each side, tap the mics, and listen to the translated line for the other person.
+          </p>
         </header>
 
-        <section className="grid gap-4">
-          <div className="rounded-3xl border border-[#dce5f1] bg-[#ffffff] p-3 md:p-4">
-            <div className="grid gap-3 md:grid-cols-[1fr_auto_1fr] md:items-center">
-              <div className="rounded-2xl border border-[#e3ebf4] bg-[#f8fbff] p-4">
+        <section className="rounded-[2rem] border border-[var(--border-subtle)] bg-[var(--bg-card)]/80 p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)] backdrop-blur-md md:p-8">
+          <div className="grid gap-6 lg:grid-cols-[1fr_auto_1fr] lg:items-start">
+            {/* Speaker A */}
+            <div className="order-1 flex min-h-0 flex-col rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-base)] p-5 lg:min-h-[280px]">
+              <div className="mb-4">
+                <label className="mb-2 block font-mono text-[10px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+                  Speaker A · hears translation below when B speaks
+                </label>
                 <select
-                  className="rounded-md border-none bg-transparent text-sm font-semibold text-[#577495] outline-none"
+                  className="w-full cursor-pointer rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-base)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)] outline-none focus:border-[var(--electric-cyan)] disabled:opacity-60"
                   value={speakerALanguage}
                   onChange={(event) => setSpeakerALanguage(event.target.value as LanguageCode)}
                   disabled={isListeningA}
@@ -595,36 +599,61 @@ export default function Home() {
                     </option>
                   ))}
                 </select>
-                <p className="mt-2 min-h-16 text-lg">{speakerATranscript}</p>
+              </div>
+              <div className="min-h-[120px] flex-1 rounded-xl bg-[var(--bg-elevated)]/80 px-4 py-3">
+                <p className="font-mono text-[10px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                  Said (A)
+                </p>
+                <p className="mt-2 min-h-[4rem] text-lg leading-relaxed text-[var(--text-primary)]">
+                  {speakerATranscript || (
+                    <span className="text-[var(--text-tertiary)]">Waiting for speech…</span>
+                  )}
+                </p>
+              </div>
+              <div className="mt-4 rounded-xl border border-[var(--border-violet-glow)] bg-[var(--violet-muted)] px-4 py-3 shadow-[inset_0_0_24px_rgba(112,0,255,0.06)]">
+                <p className="font-mono text-[10px] uppercase tracking-wider text-[var(--accent-bright)]">
+                  For speaker A · from B
+                </p>
+                <p className="mt-1 min-h-[3rem] text-base leading-relaxed text-[var(--text-primary)] [text-shadow:0_0_24px_rgba(112,0,255,0.15)]">
+                  {toSpeakerAText || <span className="text-[var(--text-tertiary)]">—</span>}
+                </p>
                 <button
                   type="button"
-                  onClick={() => playSpeakerAudio(toSpeakerAText || speakerATranscript, speakerALanguage)}
-                  className="mt-3 inline-flex items-center gap-1 text-sm text-[#5f7591]"
+                  onClick={() => void playSpeakerAudio(toSpeakerAText || speakerATranscript, speakerALanguage)}
+                  className="mt-3 inline-flex items-center gap-2 rounded-lg px-2 py-1 text-xs font-semibold text-[var(--accent-bright)] transition hover:bg-[var(--bg-card)]"
                 >
-                  <img
-                    src={`/model/sound.gif?${speakerIconPulse}`}
-                    alt="Play translation audio"
-                    className="h-4 w-4 rounded-full object-cover"
-                  />
-                  Play
+                  <Image src="/sound.gif" alt="Play" width={18} height={18} unoptimized />
+                  Play for A
                 </button>
               </div>
+            </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  const a = speakerALanguage;
-                  setSpeakerALanguage(speakerBLanguage);
-                  setSpeakerBLanguage(a);
-                }}
-                className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-[#0a84ff] text-white shadow-md"
-              >
-                <ArrowUpDown size={20} />
-              </button>
+            {/* Middle: mic buttons between the boxes */}
+            <div className="order-2 flex flex-col items-center justify-center gap-5 lg:min-w-[6rem] lg:pt-16">
+              <div className="flex flex-row items-center gap-6 lg:flex-col lg:gap-5">
+                <div className="flex flex-col items-center gap-1.5">
+                  {micButton("A")}
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                    Mic A
+                  </span>
+                </div>
+                <div className="flex flex-col items-center gap-1.5">
+                  {micButton("B")}
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                    Mic B
+                  </span>
+                </div>
+              </div>
+            </div>
 
-              <div className="rounded-2xl border border-[#e3ebf4] bg-[#f8fbff] p-4">
+            {/* Speaker B */}
+            <div className="order-3 flex min-h-0 flex-col rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-base)] p-5 lg:min-h-[280px]">
+              <div className="mb-4">
+                <label className="mb-2 block font-mono text-[10px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+                  Speaker B · hears translation below when A speaks
+                </label>
                 <select
-                  className="rounded-md border-none bg-transparent text-sm font-semibold text-[#577495] outline-none"
+                  className="w-full cursor-pointer rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-base)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)] outline-none focus:border-[var(--electric-cyan)]"
                   value={speakerBLanguage}
                   onChange={(event) => setSpeakerBLanguage(event.target.value as LanguageCode)}
                   disabled={isListeningB}
@@ -635,122 +664,120 @@ export default function Home() {
                     </option>
                   ))}
                 </select>
-                <p className="mt-2 min-h-16 text-lg">{toSpeakerBText}</p>
+              </div>
+              <div className="flex min-h-[120px] flex-1 flex-col rounded-xl border border-transparent bg-[var(--bg-elevated)]/80 px-4 py-3 ring-1 ring-[var(--border-violet-glow)]">
+                <p className="font-mono text-[10px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                  For speaker B · from A
+                </p>
+                <p className="mt-2 min-h-[4rem] flex-1 text-lg leading-relaxed text-[var(--text-primary)] [text-shadow:0_0_28px_rgba(112,0,255,0.18)]">
+                  {toSpeakerBText || (
+                    <span className="text-[var(--text-tertiary)]">Translation appears here…</span>
+                  )}
+                </p>
                 <button
                   type="button"
-                  onClick={() => playSpeakerAudio(toSpeakerBText, speakerBLanguage)}
-                  className="mt-3 inline-flex items-center gap-1 text-sm text-[#5f7591]"
+                  onClick={() => void playSpeakerAudio(toSpeakerBText, speakerBLanguage)}
+                  className="mt-auto inline-flex items-center gap-2 self-start rounded-lg px-2 py-1 text-xs font-semibold text-[var(--accent-bright)] transition hover:bg-[var(--bg-card)]"
                 >
-                  <img
-                    src={`/model/sound.gif?${speakerIconPulse}`}
-                    alt="Play translation audio"
-                    className="h-4 w-4 rounded-full object-cover"
-                  />
-                  Play
+                  <Image src="/sound.gif" alt="Play" width={18} height={18} unoptimized />
+                  Play for B
                 </button>
               </div>
             </div>
+          </div>
 
-            <div className="mt-4 flex items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={() => {
-                  setMicAPulse((value) => value + 1);
-                  if (isListeningA) {
-                    stopListening("A");
-                    return;
-                  }
-                  startListening("A");
-                }}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-[#cfdae8] bg-white text-[#1f4f7b]"
-                title="Person A mic"
-              >
-                <img
-                  src={`/model/microphone.gif?${isListeningA ? `live-${micAPulse}` : `tap-${micAPulse}`}`}
-                  alt="Person A microphone"
-                  className="h-5 w-5 rounded-full object-cover"
-                />
-              </button>
-              <button
-                type="button"
-                onClick={() => speakText(toSpeakerBText, speakerBLanguage)}
-                className="rounded-full bg-[#0a84ff] px-8 py-3 text-sm font-semibold tracking-wide text-white shadow-[0_8px_20px_rgba(10,132,255,0.35)]"
-              >
-                TRANSLATE
-              </button>
-              <button
-                type="button"
-                onClick={() => void saveCurrentTranslation()}
-                className="flex h-10 items-center justify-center gap-2 rounded-full border border-[#cfdae8] bg-white px-4 text-[#1f4f7b]"
-                title="Save translation"
-              >
-                <Bookmark size={16} />
-                Save
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMicBPulse((value) => value + 1);
-                  if (isListeningB) {
-                    stopListening("B");
-                    return;
-                  }
-                  startListening("B");
-                }}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-[#cfdae8] bg-white text-[#1f4f7b]"
-                title="Person B mic"
-              >
-                <img
-                  src={`/model/microphone.gif?${isListeningB ? `live-${micBPulse}` : `tap-${micBPulse}`}`}
-                  alt="Person B microphone"
-                  className="h-5 w-5 rounded-full object-cover"
-                />
-              </button>
+          {/* Save + Clear buttons – below speaker boxes */}
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => void saveCurrentTranslation()}
+              className="flex h-11 items-center gap-2 rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-base)] px-6 text-sm font-semibold text-[var(--text-primary)] transition hover:border-[var(--border-strong)] hover:shadow-[0_0_24px_var(--violet-glow)]"
+              title="Save current translation"
+            >
+              <Bookmark size={16} aria-hidden />
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={clearCurrentTranslation}
+              className="flex h-11 items-center gap-2 rounded-2xl border border-red-500/20 bg-[var(--bg-base)] px-6 text-sm font-semibold text-red-400 transition hover:border-red-500/40 hover:bg-red-500/5"
+              title="Clear current translation"
+            >
+              <Trash2 size={16} aria-hidden />
+              Clear
+            </button>
+          </div>
+
+          <div className="mt-10 grid gap-5 md:grid-cols-2">
+            <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-base)] p-5">
+              <div className="mb-3 flex items-center gap-2 text-[var(--text-secondary)]">
+                <Clock3 size={18} className="text-[var(--accent)]" aria-hidden />
+                <span className="text-sm font-semibold">Recent translations</span>
+              </div>
+              <div className="max-h-52 space-y-2 overflow-auto pr-1">
+                {user && translationHistory.length ? (
+                  translationHistory.slice(0, 12).map((item) => (
+                    <p
+                      key={item.id}
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-xs leading-snug text-[var(--text-secondary)]"
+                    >
+                      <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+                        {item.sourceLanguage.toUpperCase()} → {item.targetLanguage.toUpperCase()}
+                      </span>
+                      <br />
+                      <span className="text-[var(--text-primary)]">{item.sourceText}</span>
+                      <span className="text-[var(--text-tertiary)]"> · </span>
+                      <span className="font-medium text-[var(--accent-bright)]">{item.translatedText}</span>
+                    </p>
+                  ))
+                ) : (
+                  <p className="text-sm text-[var(--text-tertiary)]">
+                    {user ? "No history yet." : "Sign in to sync history."}
+                  </p>
+                )}
+              </div>
             </div>
 
-            <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <div className="rounded-2xl border border-[#e2e9f2] bg-white p-3">
-                <Clock3 className="text-[#0a84ff]" size={18} />
-                <p className="mt-1 text-xs font-semibold text-[#385678]">Translation History</p>
-                <div className="mt-2 max-h-44 space-y-2 overflow-auto">
-                  {translationHistory.length ? (
-                    translationHistory.slice(0, 10).map((item) => (
-                      <p key={item.id} className="rounded-lg border border-[#e2e9f2] bg-[#f8fbff] p-2 text-xs text-[#5a6f8a]">
-                        {item.sourceLanguage.toUpperCase()} -&gt; {item.targetLanguage.toUpperCase()} | {item.sourceText}
-                        {" => "}
-                        {item.translatedText}
-                      </p>
-                    ))
-                  ) : (
-                    <p className="text-xs text-[#5a6f8a]">No history yet.</p>
-                  )}
-                </div>
+            <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-base)] p-5">
+              <div className="mb-3 flex items-center gap-2 text-[var(--text-secondary)]">
+                <Bookmark size={18} className="text-[var(--cyan)]" aria-hidden />
+                <span className="text-sm font-semibold">Saved</span>
               </div>
-              <div className="rounded-2xl border border-[#e2e9f2] bg-white p-3">
-                <Bookmark className="text-[#0a84ff]" size={18} />
-                <p className="mt-1 text-xs font-semibold text-[#385678]">Saved Translations</p>
-                <div className="mt-2 max-h-44 space-y-2 overflow-auto">
-                  {savedTranslations.length ? (
-                    savedTranslations.slice(0, 10).map((item) => (
-                      <p key={item.id} className="rounded-lg border border-[#e2e9f2] bg-[#f8fbff] p-2 text-xs text-[#5a6f8a]">
-                        {item.sourceLanguage.toUpperCase()} -&gt; {item.targetLanguage.toUpperCase()} | {item.sourceText}
-                        {" => "}
-                        {item.translatedText}
-                      </p>
-                    ))
-                  ) : (
-                    <p className="text-xs text-[#5a6f8a]">No saved translations yet.</p>
-                  )}
-                </div>
+              <div className="max-h-52 space-y-2 overflow-auto pr-1">
+                {user && savedTranslations.length ? (
+                  savedTranslations.slice(0, 12).map((item) => (
+                    <p
+                      key={item.id}
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-xs leading-snug text-[var(--text-secondary)]"
+                    >
+                      <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+                        {item.sourceLanguage.toUpperCase()} → {item.targetLanguage.toUpperCase()}
+                      </span>
+                      <br />
+                      <span className="text-[var(--text-primary)]">{item.sourceText}</span>
+                      <span className="text-[var(--text-tertiary)]"> · </span>
+                      <span className="font-medium text-[var(--accent-bright)]">{item.translatedText}</span>
+                    </p>
+                  ))
+                ) : (
+                  <p className="text-sm text-[var(--text-tertiary)]">
+                    {user ? "Nothing saved yet." : "Sign in to save phrases."}
+                  </p>
+                )}
               </div>
             </div>
           </div>
         </section>
 
         {errorMessage ? (
-          <p className="mt-4 rounded-xl bg-[#ffdfe3] px-3 py-2 text-sm text-[#8a2832]">{errorMessage}</p>
+          <div
+            role="alert"
+            className="mt-6 rounded-2xl border border-red-500/30 bg-[var(--danger-bg)] px-4 py-3 text-sm text-[var(--danger-text)]"
+          >
+            {errorMessage}
+          </div>
         ) : null}
-      </main>
-    </div>
+      </div>
+    </main>
   );
 }

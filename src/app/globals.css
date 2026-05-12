@@ -1,33 +1,60 @@
 @import "tailwindcss";
 
+/*
+  Deep Flux — Liquid Chrome / Electric Bioluminescence (2026)
+  Primary: #00F5FF Electric Cyan — listening, active voice, focus
+  Secondary: #7000FF Hyper Violet — buttons, translated emphasis
+  Background: #0A0A0F Obsidian Blue
+  Text: #E0E0E0 Soft Silver
+*/
 :root {
-  --background: #e0e0ce;
-  --foreground: #000000;
-  --app-primary: #ad343e;
-  --app-muted: #474747;
-  --app-accent: #f2af29;
-  --app-dark: #000000;
-  --app-light: #e0e0ce;
-  --app-panel: #f3f3e8;
+  --bg-base: #0a0a0f;
+  --bg-elevated: #12121a;
+  --bg-card: #16161f;
+  --bg-card-hover: #1c1c28;
+  --border-subtle: rgba(0, 245, 255, 0.08);
+  --border-strong: rgba(112, 0, 255, 0.45);
+  --border-violet-glow: rgba(112, 0, 255, 0.35);
+  --text-primary: #e0e0e0;
+  --text-secondary: #a3a3a3;
+  --text-tertiary: #737373;
+  --electric-cyan: #00f5ff;
+  --hyper-violet: #7000ff;
+  --cyan-muted: rgba(0, 245, 255, 0.14);
+  --cyan-glow: rgba(0, 245, 255, 0.35);
+  --violet-glow: rgba(112, 0, 255, 0.4);
+  --violet-muted: rgba(112, 0, 255, 0.12);
+  /* Semantic aliases for existing component vars */
+  --accent: var(--hyper-violet);
+  --accent-bright: #9035ff;
+  --accent-glow: var(--violet-glow);
+  --cyan: var(--electric-cyan);
+  --danger-bg: rgba(248, 113, 113, 0.1);
+  --danger-text: #fecaca;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-app-bg: var(--background);
-  --color-app-text: var(--foreground);
-  --color-app-primary: var(--app-primary);
-  --color-app-muted: var(--app-muted);
-  --color-app-accent: var(--app-accent);
-  --color-app-dark: var(--app-dark);
-  --color-app-light: var(--app-light);
-  --color-app-panel: var(--app-panel);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-background: var(--bg-base);
+  --color-foreground: var(--text-primary);
+  --color-app-bg: var(--bg-base);
+  --color-app-text: var(--text-primary);
+  --color-app-primary: var(--hyper-violet);
+  --color-app-muted: var(--text-secondary);
+  --color-app-accent: var(--electric-cyan);
+  --color-app-dark: var(--bg-elevated);
+  --color-app-light: var(--text-primary);
+  --color-app-panel: var(--bg-card);
+  --font-sans: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Inter, Arial, Helvetica, sans-serif;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--electric-cyan);
+  outline-offset: 2px;
 }
